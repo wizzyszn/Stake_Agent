@@ -1,0 +1,68 @@
+# Bet_Agentic_AI Setup and Caveats
+
+This document outlines the setup process for the Bet_Agentic_AI project and highlights potential issues you might encounter, along with solutions.
+
+## Setup Process
+
+1.  **Install Poetry:**
+
+    *   Ensure you have Poetry installed. If not, follow the instructions on the official Poetry website: [https://python-poetry.org/docs/](https://python-poetry.org/docs/)
+
+2.  **Project Setup:**
+
+    *   Navigate to the project directory: `cd Bet_Agentic_AI`
+
+3.  **Create Virtual Environment:**
+
+    *   Poetry automatically manages virtual environments. If one doesn't exist yet, Poetry will create one when you install dependencies.
+
+4.  **Install Dependencies:**
+
+    *   Run `poetry install` to install the project dependencies specified in `pyproject.toml`.
+    *   If you encounter an error related to a missing `README.md` file, either create an empty `README.md` file (`touch README.md`) or add `package-mode = false` to your `pyproject.toml` file under the `[tool.poetry]` section.
+
+5.  **Activate Virtual Environment:**
+
+    *   Activate the Poetry-managed virtual environment using `poetry env activate`.
+
+6.  **Configure VS Code (if using):**
+
+    *   **Select Interpreter:** In VS Code, select the Python interpreter associated with your Poetry environment. Use the Command Palette (Ctrl+Shift+P or Cmd+Shift+P) and type "Python: Select Interpreter". Choose the interpreter located in the Poetry environment (e.g., `~/.cache/pypoetry/virtualenvs/bet-agentic-ai-<hash>/bin/python`).
+    *   **Add Extra Paths:** In VS Code settings (Ctrl+,), search for "Python › Analysis: Extra Paths" and add the path to your Poetry environment's `site-packages` directory: `~/.cache/pypoetry/virtualenvs/bet-agentic-ai-<hash>/lib/python3.11/site-packages`.  Replace `<hash>` with the actual hash for your environment.
+
+## Potential Caveats and Solutions
+
+1.  **"Unresolved Import" Errors (e.g., `uagents`):**
+
+    *   **Problem:** VS Code or the Python interpreter cannot find the installed packages, even though they are listed in `pyproject.toml` and the virtual environment is activated.
+    *   **Possible Causes and Solutions:**
+        *   **Incorrect Interpreter:** Ensure VS Code is using the correct Python interpreter from the Poetry environment (see "Configure VS Code" above).
+        *   **Missing `site-packages` Path:** Verify that the `python.analysis.extraPaths` setting in VS Code includes the path to your Poetry environment's `site-packages` directory (see "Configure VS Code" above).
+        *   **Outdated `poetry.lock` File:** Run `poetry update` to update dependencies and the `poetry.lock` file.
+        *   **Poetry Cache Issues:** Clear the Poetry cache using `poetry cache clear --all` and remove the cache directory `rm -rf ~/.cache/pypoetry/cache`. Then, run `poetry install` again.
+        *   **VS Code Caching:** Clear VS Code's IntelliSense cache by deleting the `.vscode` folder in your project and the contents of `~/.cache/Microsoft/Python Language Server`.
+        *   **Extension Conflicts:** Temporarily disable other VS Code extensions to see if they are interfering with the Python language server.
+        *   **VS Code Restart:** Restart VS Code to ensure that all settings and caches are reloaded.
+        *   **Force Re-indexing:** Delete the `.vscode` folder in your project directory (if it exists). This folder contains VS Code-specific settings and cache data. Reopen VS Code. This will force it to re-analyze the project and rebuild its IntelliSense index.
+        *   **Reinstall:** Disable and Re-enable the Python Extension.
+
+2.  **`poetry install` Errors:**
+
+    *   **Problem:** `poetry install` fails with errors.
+    *   **Possible Causes and Solutions:**
+        *   **Missing `README.md`:** Create an empty `README.md` file or add `package-mode = false` to your `pyproject.toml`.
+        *   **Conflicting Dependencies:** Run `poetry update` to resolve any version conflicts.
+        *   **Python Version:** Ensure your Python version is compatible with the project's `requires-python` setting in `pyproject.toml`.
+
+3.  **Virtual Environment Activation Issues:**
+
+    *   **Problem:** The virtual environment is not activated correctly.
+    *   **Possible Causes and Solutions:**
+        *   **Use `poetry env activate`:** Use the `poetry env activate` command to activate the environment.
+        *   **Shell Configuration:** Ensure your shell is properly configured to work with Poetry's virtual environments.
+
+## General Tips
+
+*   Always activate the Poetry environment before running any Python code in the project.
+*   Restart VS Code after making significant changes to the project configuration or dependencies.
+*   Consult the Poetry documentation for more information: [https://python-poetry.org/docs/](https://python-poetry.org/docs/)
