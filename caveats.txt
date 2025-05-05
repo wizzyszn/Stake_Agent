@@ -23,7 +23,7 @@ This document outlines the setup process for the Bet_Agentic_AI project and high
 
 5.  **Activate Virtual Environment:**
 
-    *   Activate the Poetry-managed virtual environment using `poetry env activate`.
+    *   Activate the Poetry-managed virtual environment using `poetry env activate or  source  /home/wizzy_szn/.cache/pypoetry/virtualenvs/bet-agentic-ai-xpLV6xiu-py3.11/bin/activate`.
 
 6.  **Configure VS Code (if using):**
 
