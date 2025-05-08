@@ -6,14 +6,12 @@ from solders.keypair import Keypair
 import time
 from dataclasses import dataclass
 from typing import Union, Dict, TypeAlias
-
 """
 Registers on Almanac so that other agents (player or challenger) can discover it
 Waits for two Escrow Requests
 Fetched BTC prices from Binance
 Transfers the correct portion of SOl to the winner
 """
-
 
 # Define classes that defines the structured message format between agents
 class EscrowRequest(Model):
@@ -59,5 +57,7 @@ async def escrow_request_handler(ctx: Context, comparison: str, msg: EscrowReque
     elif current_count == 1:
         storage[msg.public_key] = EscrowRequest(
             price=msg.price, amount=msg.amount, public_key=msg.public_key
-        )
+        )  
+
+#replacing with calls to escrow smart contract
         
