@@ -1,7 +1,8 @@
 import os
 import requests
 import logging
-import sqlite3
+import json
+import time
 from datetime import datetime, timedelta
 from uagents import Agent, Context, Model
 from uagents.setup import fund_agent_if_low
@@ -10,6 +11,12 @@ from web3.middleware import geth_poa_middleware
 from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential
 from fetchai.registration import register_with_agentverse
+import prometheus_client
+from prometheus_client import Counter, Gauge, Histogram
+import asyncio
+import threading
+import socket
+import healthchecks_io
 
 # Configure logging
 logging.basicConfig(
@@ -25,26 +32,45 @@ ESCROW_CONTRACT_ADDRESS = os.getenv("ESCROW_CONTRACT_ADDRESS")
 ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY")
 AGENT_PRIVATE_KEY = os.getenv("AGENT_PRIVATE_KEY")
 AGENT_SEED = os.getenv("AGENT_SEED")
+HEALTHCHECK_API_KEY = os.getenv("HEALTHCHECK_API_KEY")
+ESCROW_API_ENDPOINT = "https://escrow-server-yypr.onrender.com/api/v1/bet"
+#API_TOKEN = os.getenv("ESCROW_API_TOKEN")
+
+# Initialize health check client
+healthcheck = healthchecks_io.Client(HEALTHCHECK_API_KEY)
+
+# Initialize Prometheus metrics
+prom_port = 8001
+prometheus_client.start_http_server(prom_port)
+logger.info(f"Prometheus metrics server started on port {prom_port}")
+
+# Define metrics
+BET_RESOLUTIONS = Counter('bet_resolutions_total', 'Number of bet resolutions attempted', ['status'])
+API_REQUESTS = Counter('api_requests_total', 'Number of API requests', ['endpoint', 'status'])
+BLOCKCHAIN_TRANSACTIONS = Counter('blockchain_transactions_total', 'Number of blockchain transactions', ['type', 'status'])
+AGENT_UP = Gauge('agent_up', 'Whether the agent is up and running')
+API_RESPONSE_TIME = Histogram('api_response_time_seconds', 'API response time in seconds', ['endpoint'])
+DB_OPERATIONS = Counter('db_operations_total', 'Number of database operations', ['operation', 'status'])
 
 # Full Escrow contract ABI
 ESCROW_ABI = [
     {
-        "anonymous": false,
+        "anonymous": False,
         "inputs": [
             {
-                "indexed": true,
+                "indexed": True,
                 "internalType": "bytes32",
                 "name": "storeHash",
                 "type": "bytes32",
             },
             {
-                "indexed": true,
+                "indexed": True,
                 "internalType": "address",
                 "name": "acceptor",
                 "type": "address",
             },
             {
-                "indexed": false,
+                "indexed": False,
                 "internalType": "bytes32",
                 "name": "choice",
                 "type": "bytes32",
@@ -54,10 +80,10 @@ ESCROW_ABI = [
         "type": "event",
     },
     {
-        "anonymous": false,
+        "anonymous": False,
         "inputs": [
             {
-                "indexed": true,
+                "indexed": True,
                 "internalType": "bytes32",
                 "name": "storeHash",
                 "type": "bytes32",
@@ -67,22 +93,22 @@ ESCROW_ABI = [
         "type": "event",
     },
     {
-        "anonymous": false,
+        "anonymous": False,
         "inputs": [
             {
-                "indexed": true,
+                "indexed": True,
                 "internalType": "bytes32",
                 "name": "storeHash",
                 "type": "bytes32",
             },
             {
-                "indexed": true,
+                "indexed": True,
                 "internalType": "uint256",
                 "name": "amount",
                 "type": "uint256",
             },
             {
-                "indexed": true,
+                "indexed": True,
                 "internalType": "address",
                 "name": "winner",
                 "type": "address",
@@ -92,40 +118,40 @@ ESCROW_ABI = [
         "type": "event",
     },
     {
-        "anonymous": false,
+        "anonymous": False,
         "inputs": [
             {
-                "indexed": true,
+                "indexed": True,
                 "internalType": "bytes32",
                 "name": "storeHash",
                 "type": "bytes32",
             },
             {
-                "indexed": true,
+                "indexed": True,
                 "internalType": "address",
                 "name": "depositor",
                 "type": "address",
             },
             {
-                "indexed": false,
+                "indexed": False,
                 "internalType": "bytes32",
                 "name": "identity",
                 "type": "bytes32",
             },
             {
-                "indexed": false,
+                "indexed": False,
                 "internalType": "bytes32",
                 "name": "matchId",
                 "type": "bytes32",
             },
             {
-                "indexed": false,
+                "indexed": False,
                 "internalType": "bytes32",
                 "name": "choice",
                 "type": "bytes32",
             },
             {
-                "indexed": false,
+                "indexed": False,
                 "internalType": "uint256",
                 "name": "amount",
                 "type": "uint256",
@@ -219,21 +245,6 @@ ESCROW_ABI = [
 ]
 
 
-# Initialize SQLite database
-def init_db():
-    conn = sqlite3.connect("bets.db")
-    c = conn.cursor()
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS bets
-                 (store_hash TEXT PRIMARY KEY, match_id TEXT, match_date TEXT, match_time TEXT, choice_a TEXT, choice_b TEXT, player TEXT, challenger TEXT, status TEXT)"""
-    )
-    conn.commit()
-    conn.close()
-
-
-init_db()
-
-
 # Message model for bet resolution
 class BetResolution(Model):
     storeHash: str  # Hex string for bytes32
@@ -246,23 +257,226 @@ class BetResolution(Model):
     matchTime: str  # Time (e.g., 21:00)
 
 
-# Initialize uAgent
-resolver_agent = Agent(
-    name="FootballBetResolver",
-    port=8000,
-    seed=AGENT_SEED,
-    endpoint=["http://localhost:8000/submit"],
-)
+# API client with retry and circuit breaker patterns
+class APIClient:
+    def __init__(self, base_url, api_key=None, timeout=10):
+        self.base_url = base_url
+        self.api_key = api_key
+        self.timeout = timeout
+        self.circuit_open = False
+        self.failure_count = 0
+        self.failure_threshold = 5
+        self.reset_timeout = 60  
+        self.last_failure_time = 0
+        
+    async def request(self, method, endpoint, params=None, data=None, headers=None):
+        # Check if circuit breaker is open
+        if self.circuit_open:
+            if time.time() - self.last_failure_time > self.reset_timeout:
+                logger.info(f"Circuit breaker reset for {self.base_url}")
+                self.circuit_open = False
+                self.failure_count = 0
+            else:
+                logger.warning(f"Circuit breaker open for {self.base_url}, request rejected")
+                API_REQUESTS.labels(endpoint=endpoint, status="circuit_open").inc()
+                raise Exception(f"Circuit breaker open for {self.base_url}")
+        
+        # Prepare request
+        url = f"{self.base_url}/{endpoint}" if endpoint else self.base_url
+        if not headers:
+            headers = {}
+        if self.api_key:
+            headers["APIkey"] = self.api_key
+            
+        start_time = time.time()
+        try:
+            # Make request with retry logic
+            response = await self._make_request_with_retry(method, url, params, data, headers)
+            
+            # Measure response time
+            duration = time.time() - start_time
+            API_RESPONSE_TIME.labels(endpoint=endpoint).observe(duration)
+            
+            # Reset failure count on success
+            self.failure_count = 0
+            API_REQUESTS.labels(endpoint=endpoint, status="success").inc()
+            
+            return response
+        except Exception as e:
+            # Handle failure and potentially trip circuit breaker
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            
+            if self.failure_count >= self.failure_threshold:
+                self.circuit_open = True
+                logger.error(f"Circuit breaker tripped for {self.base_url} after {self.failure_count} failures")
+            
+            API_REQUESTS.labels(endpoint=endpoint, status="error").inc()
+            logger.error(f"API request to {url} failed: {str(e)}")
+            raise
+            
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    async def _make_request_with_retry(self, method, url, params, data, headers):
+        if method.lower() == "get":
+            response = requests.get(url, params=params, headers=headers, timeout=self.timeout)
+        elif method.lower() == "post":
+            response = requests.post(url, params=params, json=data, headers=headers, timeout=self.timeout)
+        else:
+            raise ValueError(f"Unsupported HTTP method: {method}")
+            
+        response.raise_for_status()
+        return response.json()
 
 
-# Register agent with Agentverse
-@resolver_agent.on_event("startup")
-async def register_agent(ctx: Context):
-    identity = resolver_agent.identity
-    register_with_agentverse(identity, AGENTVERSE_KEY)
-    ctx.logger.info(f"Agent registered on Agentverse: {resolver_agent.address}")
-    await fund_agent_if_low(ctx.ledger)
+# Database operations through API
+class EscrowDatabase:
+    def __init__(self, api_endpoint):
+        self.api_endpoint = api_endpoint
+        self.headers = {
+            #"Authorization": f"Bearer {api_token}",
+            "Content-Type": "application/json"
+        }
+        
+        
+    async def store_bet(self, store_hash, match_id, match_date, match_time, choice_a, choice_b, player, challenger):
+        try:
+            data = {
+                "store_hash": store_hash,
+                "match_id": match_id,
+                "match_date": match_date,
+                "match_time": match_time,
+                "choice_a": choice_a,
+                "choice_b": choice_b,
+                "player": player,
+                "challenger": challenger,
+                "status": "pending"
+            }
+            
+            response = requests.post(
+                self.api_endpoint, 
+                json=data,
+                headers=self.headers
+            )
+            response.raise_for_status()
+            DB_OPERATIONS.labels(operation="store", status="success").inc()
+            logger.info(f"Stored bet in database: {store_hash}")
+            return True
+        except Exception as e:
+            DB_OPERATIONS.labels(operation="store", status="error").inc()
+            logger.error(f"Failed to store bet {store_hash}: {str(e)}")
+            return False
+            
+    async def get_pending_bets(self):
+        try:
+            response = requests.get(
+                f"{self.api_endpoint}/pending",
+                headers=self.headers
+            )
+            response.raise_for_status()
+            data = response.json()
+            DB_OPERATIONS.labels(operation="get_pending", status="success").inc()
+            return data
+        except Exception as e:
+            DB_OPERATIONS.labels(operation="get_pending", status="error").inc()
+            logger.error(f"Failed to get pending bets: {str(e)}")
+            return []
+            
+    async def update_bet_status(self, store_hash, status):
+        try:
+            data = {
+                "store_hash": store_hash,
+                "status": status
+            }
+            response = requests.patch(
+                f"{self.api_endpoint}/{store_hash}/status",
+                json=data,
+                headers=self.headers
+            )
+            response.raise_for_status()
+            DB_OPERATIONS.labels(operation="update", status="success").inc()
+            logger.info(f"Updated bet status to {status}: {store_hash}")
+            return True
+        except Exception as e:
+            DB_OPERATIONS.labels(operation="update", status="error").inc()
+            logger.error(f"Failed to update bet status {store_hash}: {str(e)}")
+            return False
 
+
+# Initialize uAgent with redundancy support
+def create_resolver_agent(port):
+    agent = Agent(
+        name=f"FootballBetResolver-{port}",
+        port=port,
+        seed=f"{AGENT_SEED}-{port}",  # Unique seed per instance
+        endpoint=[f"http://localhost:{port}/submit"],
+    )
+    return agent
+
+
+# Create primary and backup agents
+resolver_agent_primary = create_resolver_agent(8000)
+resolver_agent_backup = create_resolver_agent(8002)
+
+# Flag to determine which agent is active
+active_agent = resolver_agent_primary
+backup_agent = resolver_agent_backup
+is_primary_active = True
+
+# Health check function for redundancy
+async def health_check_task(ctx):
+    global active_agent, backup_agent, is_primary_active
+    
+    while True:
+        try:
+            # Signal to healthchecks.io that we're alive
+            healthcheck.ping()
+            AGENT_UP.set(1)
+            
+            # Check if primary agent is responsive
+            if is_primary_active:
+                # Try to access primary agent status
+                try:
+                    # Simple check if agent is running - ping its port
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(2)
+                    result = sock.connect_ex(('localhost', 8000))
+                    sock.close()
+                    
+                    if result != 0:  # Port is not open
+                        logger.warning("Primary agent is down, switching to backup")
+                        active_agent = backup_agent
+                        is_primary_active = False
+                except Exception as e:
+                    logger.error(f"Error checking primary agent: {e}")
+                    active_agent = backup_agent
+                    is_primary_active = False
+            else:
+                # Check if primary is back up
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(2)
+                    result = sock.connect_ex(('localhost', 8000))
+                    sock.close()
+                    
+                    if result == 0:  # Port is open
+                        logger.info("Primary agent is back up, switching from backup")
+                        active_agent = resolver_agent_primary
+                        is_primary_active = True
+                except Exception:
+                    # Keep using backup
+                    pass
+        except Exception as e:
+            logger.error(f"Health check task failed: {e}")
+            AGENT_UP.set(0)
+            
+        await asyncio.sleep(30)  # Check every 30 seconds
+
+
+# Initialize Football API client
+football_api = APIClient("https://apiv3.apifootball.com", API_FOOTBALL_KEY)
+
+# Initialize database client
+db = EscrowDatabase(ESCROW_API_ENDPOINT)
 
 # Initialize Web3 with Alchemy
 w3 = Web3(
@@ -275,9 +489,33 @@ if not w3.is_connected():
 contract = w3.eth.contract(address=ESCROW_CONTRACT_ADDRESS, abi=ESCROW_ABI)
 
 
-# Monitor BetAccepted events
-@resolver_agent.on_event("startup")
-async def setup_event_listener(ctx: Context):
+# Common setup function for both agents
+async def common_agent_setup(agent, ctx: Context):
+    # Register agent with Agentverse
+    identity = agent.identity
+    register_with_agentverse(identity, AGENTVERSE_KEY)
+    ctx.logger.info(f"Agent registered on Agentverse: {agent.address}")
+    await fund_agent_if_low(ctx.ledger)
+    
+    # Start health check task only on primary agent
+    if agent == resolver_agent_primary:
+        ctx.create_task(health_check_task(ctx))
+
+
+# Register primary agent with Agentverse
+@resolver_agent_primary.on_event("startup")
+async def register_primary_agent(ctx: Context):
+    await common_agent_setup(resolver_agent_primary, ctx)
+
+
+# Register backup agent with Agentverse
+@resolver_agent_backup.on_event("startup")
+async def register_backup_agent(ctx: Context):
+    await common_agent_setup(resolver_agent_backup, ctx)
+
+
+# Monitor BetAccepted events for both agents
+async def setup_event_listener_common(ctx: Context):
     event_filter = contract.events.BetAccepted.create_filter(fromBlock="latest")
 
     async def process_events():
@@ -285,30 +523,52 @@ async def setup_event_listener(ctx: Context):
             try:
                 for event in event_filter.get_new_entries():
                     store_hash = event.args.storeHash.hex()
-                    storage = contract.functions.escrowStorage(
-                        event.args.storeHash
-                    ).call()
-                    match_id = storage[0].hex()
-                    player = storage[1]
-                    challenger = storage[2]
-                    choice_a = storage[3].hex()
-                    choice_b = storage[4].hex()
+                    
+                    try:
+                        storage = contract.functions.escrowStorage(
+                            event.args.storeHash
+                        ).call()
+                        
+                        match_id = storage[0].hex()
+                        player = storage[1]
+                        challenger = storage[2]
+                        choice_a = storage[3].hex()
+                        choice_b = storage[4].hex()
 
-                    # Query APIFootball for match details (date, time)
-                    match_details = await get_match_details(match_id)
-                    if not match_details:
-                        ctx.logger.error(f"No match details for matchId={match_id}")
-                        continue
+                        # Query APIFootball for match details (date, time)
+                        match_details = None
+                        try:
+                            # Get current date
+                            current_date = datetime.now().strftime("%Y-%m-%d")
+                            
+                            # Make API request
+                            params = {
+                                "action": "get_events",
+                                "from": current_date,
+                                "to": current_date,
+                                "match_id": match_id,
+                            }
+                            response = await football_api.request("get", "", params=params)
+                            
+                            if response and isinstance(response, list) and len(response) > 0:
+                                match_details = response[0]
+                        except Exception as e:
+                            ctx.logger.error(f"Failed to get match details: {e}")
+                            continue
+                            
+                        if not match_details:
+                            ctx.logger.error(f"No match details for matchId={match_id}")
+                            continue
 
-                    match_date = match_details["match_date"]
-                    match_time = match_details["match_time"]
+                        match_date = match_details.get("match_date")
+                        match_time = match_details.get("match_time")
+                        
+                        if not match_date or not match_time:
+                            ctx.logger.error(f"Invalid match date/time for matchId={match_id}")
+                            continue
 
-                    # Store bet in SQLite
-                    conn = sqlite3.connect("bets.db")
-                    c = conn.cursor()
-                    c.execute(
-                        "INSERT OR IGNORE INTO bets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (
+                        # Store bet in database
+                        await db.store_bet(
                             store_hash,
                             match_id,
                             match_date,
@@ -316,101 +576,135 @@ async def setup_event_listener(ctx: Context):
                             choice_a,
                             choice_b,
                             player,
-                            challenger,
-                            "pending",
-                        ),
-                    )
-                    conn.commit()
-                    conn.close()
+                            challenger
+                        )
 
-                    ctx.logger.info(
-                        f"Stored bet: storeHash={store_hash}, matchId={match_id}"
-                    )
+                        ctx.logger.info(
+                            f"Stored bet: storeHash={store_hash}, matchId={match_id}"
+                        )
+                    except Exception as e:
+                        ctx.logger.error(f"Error processing bet event: {e}")
+                        
             except Exception as e:
                 ctx.logger.error(f"Error processing events: {e}")
+            
             await asyncio.sleep(10)  # Poll every 10 seconds
 
     ctx.create_task(process_events())
 
 
-# Fetch match details from APIFootball
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-async def get_match_details(match_id: str) -> dict:
-    url = "https://apiv3.apifootball.com/"
-    params = {
-        "action": "get_events",
-        "from": datetime.now().strftime("%Y-%m-%d"),
-        "to": datetime.now().strftime("%Y-%m-%d"),
-        "match_id": match_id,
-        "APIkey": API_FOOTBALL_KEY,
-    }
-    response = requests.get(url, params=params)
-    response.raise_for_status()
-    data = response.json()
-    return data[0] if data else None
+# Event listener for primary agent
+@resolver_agent_primary.on_event("startup")
+async def setup_event_listener(ctx: Context):
+    await setup_event_listener_common(ctx)
 
 
-# Check pending bets and resolve
-@resolver_agent.on_interval(period=300.0)  # Check every 5 minutes
-async def check_pending_bets(ctx: Context):
-    conn = sqlite3.connect("bets.db")
-    c = conn.cursor()
-    c.execute("SELECT * FROM bets WHERE status = 'pending'")
-    bets = c.fetchall()
-    conn.close()
-
-    for bet in bets:
-        (
-            store_hash,
-            match_id,
-            match_date,
-            match_time,
-            choice_a,
-            choice_b,
-            player,
-            challenger,
-            _,
-        ) = bet
-        match_datetime = datetime.strptime(
-            f"{match_date} {match_time}", "%Y-%m-%d %H:%M"
-        )
-        if datetime.now() < match_datetime + timedelta(
-            hours=2
-        ):  # Wait 2 hours post-match
-            continue
-
-        await ctx.send(
-            resolver_agent.address,
-            BetResolution(
-                storeHash=store_hash,
-                matchId=match_id,
-                choiceA=choice_a,
-                choiceB=choice_b,
-                player=player,
-                challenger=challenger,
-                matchDate=match_date,
-                matchTime=match_time,
-            ),
-        )
+# Event listener for backup agent
+@resolver_agent_backup.on_event("startup")
+async def setup_backup_event_listener(ctx: Context):
+    await setup_event_listener_common(ctx)
 
 
-# Resolve bet by querying APIFootball
-@resolver_agent.on_message(model=BetResolution)
-async def resolve_bet(ctx: Context, sender: str, msg: BetResolution):
+# Check pending bets and resolve - for both agents
+async def check_pending_bets_common(ctx: Context):
+    # Only the active agent should process pending bets
+    if ctx.address != active_agent.address:
+        return
+        
+    try:
+        # Get pending bets from database
+        pending_bets = await db.get_pending_bets()
+        
+        for bet in pending_bets:
+            store_hash = bet.get("store_hash")
+            match_id = bet.get("match_id")
+            match_date = bet.get("match_date")
+            match_time = bet.get("match_time")
+            choice_a = bet.get("choice_a")
+            choice_b = bet.get("choice_b")
+            player = bet.get("player")
+            challenger = bet.get("challenger")
+            
+            # Validate bet data
+            if not all([store_hash, match_id, match_date, match_time, choice_a, choice_b, player, challenger]):
+                ctx.logger.error(f"Invalid bet data: {bet}")
+                continue
+                
+            # Parse match datetime
+            try:
+                match_datetime = datetime.strptime(
+                    f"{match_date} {match_time}", "%Y-%m-%d %H:%M"
+                )
+            except ValueError:
+                ctx.logger.error(f"Invalid date format for bet {store_hash}: {match_date} {match_time}")
+                continue
+                
+            # Check if match has finished (plus grace period)
+            if datetime.now() < match_datetime + timedelta(hours=2):
+                ctx.logger.info(f"Match not yet finished for bet {store_hash}")
+                continue
+
+            # Log that we're sending a bet resolution
+            ctx.logger.info(f"Sending bet resolution for {store_hash}")
+            
+            # Send resolution request
+            await ctx.send(
+                active_agent.address,  # Send to active agent
+                BetResolution(
+                    storeHash=store_hash,
+                    matchId=match_id,
+                    choiceA=choice_a,
+                    choiceB=choice_b,
+                    player=player,
+                    challenger=challenger,
+                    matchDate=match_date,
+                    matchTime=match_time,
+                ),
+            )
+    except Exception as e:
+        ctx.logger.error(f"Error checking pending bets: {e}")
+
+
+# Check pending bets interval for primary agent
+@resolver_agent_primary.on_interval(period=300.0)  # Check every 5 minutes
+async def check_primary_pending_bets(ctx: Context):
+    await check_pending_bets_common(ctx)
+
+
+# Check pending bets interval for backup agent
+@resolver_agent_backup.on_interval(period=300.0)  # Check every 5 minutes
+async def check_backup_pending_bets(ctx: Context):
+    await check_pending_bets_common(ctx)
+
+
+# Resolve bet handler - common implementation
+async def resolve_bet_common(ctx: Context, sender: str, msg: BetResolution):
+    BET_RESOLUTIONS.labels(status="attempted").inc()
+    
     try:
         # Query APIFootball for match result
-        url = "https://apiv3.apifootball.com/"
         params = {
             "action": "get_events",
             "from": msg.matchDate,
             "to": msg.matchDate,
             "match_id": msg.matchId,
-            "APIkey": API_FOOTBALL_KEY,
         }
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        result = response.json()[0]
-
+        
+        response = await football_api.request("get", "", params=params)
+        
+        if not response or not isinstance(response, list) or len(response) == 0:
+            ctx.logger.error(f"No match result for matchId={msg.matchId}")
+            BET_RESOLUTIONS.labels(status="api_error").inc()
+            return
+            
+        result = response[0]
+        
+        # Validate match result data
+        if not all(k in result for k in ["match_hometeam_score", "match_awayteam_score", "match_hometeam_name", "match_awayteam_name"]):
+            ctx.logger.error(f"Invalid match result data for matchId={msg.matchId}")
+            BET_RESOLUTIONS.labels(status="invalid_data").inc()
+            return
+            
         home_score = int(result["match_hometeam_score"])
         away_score = int(result["match_awayteam_score"])
         home_team = result["match_hometeam_name"]
@@ -419,9 +713,14 @@ async def resolve_bet(ctx: Context, sender: str, msg: BetResolution):
         # Prepare transaction
         account = w3.eth.account.from_key(AGENT_PRIVATE_KEY)
         nonce = w3.eth.get_transaction_count(account.address)
+        
+        # Use gas price strategy for optimization
         gas_price = w3.eth.gas_price
+        # Add 10% to ensure transaction goes through
+        gas_price = int(gas_price * 1.1)
 
         if home_score == away_score:
+            # Draw scenario
             tx = contract.functions.declareDraw(
                 w3.to_bytes(hexstr=msg.storeHash)
             ).build_transaction(
@@ -433,23 +732,34 @@ async def resolve_bet(ctx: Context, sender: str, msg: BetResolution):
                 }
             )
             ctx.logger.info(f"Declaring draw for storeHash={msg.storeHash}")
+            BLOCKCHAIN_TRANSACTIONS.labels(type="declare_draw", status="pending").inc()
         else:
             # Determine winner
             winner_team = home_team if home_score > away_score else away_team
-            winner = (
-                msg.player
-                if Web3.to_text(hexstr=msg.choiceA) == winner_team
-                else (
-                    msg.challenger
-                    if Web3.to_text(hexstr=msg.choiceB) == winner_team
-                    else None
-                )
-            )
+            
+            # Convert choices to text (safely)
+            try:
+                choice_a_text = Web3.to_text(hexstr=msg.choiceA)
+                choice_b_text = Web3.to_text(hexstr=msg.choiceB)
+            except Exception as e:
+                ctx.logger.error(f"Error converting choices to text: {e}")
+                BET_RESOLUTIONS.labels(status="conversion_error").inc()
+                return
+                
+            # Determine winner address
+            winner = None
+            if choice_a_text == winner_team:
+                winner = msg.player
+            elif choice_b_text == winner_team:
+                winner = msg.challenger
+                
             if not winner:
                 ctx.logger.error(
                     f"Invalid winner for storeHash={msg.storeHash}, outcome={winner_team}"
                 )
+                BET_RESOLUTIONS.labels(status="invalid_winner").inc()
                 return
+                
             tx = contract.functions.releaseFunds(
                 w3.to_bytes(hexstr=msg.storeHash), winner
             ).build_transaction(
@@ -463,26 +773,151 @@ async def resolve_bet(ctx: Context, sender: str, msg: BetResolution):
             ctx.logger.info(
                 f"Releasing funds to winner={winner} for storeHash={msg.storeHash}"
             )
+            BLOCKCHAIN_TRANSACTIONS.labels(type="release_funds", status="pending").inc()
 
-        # Sign and send transaction
-        signed_tx = w3.eth.account.sign_transaction(tx, AGENT_PRIVATE_KEY)
-        tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
-        ctx.logger.info(f"Transaction sent: {tx_hash.hex()}")
-
-        # Update bet status
-        conn = sqlite3.connect("bets.db")
-        c = conn.cursor()
-        c.execute(
-            "UPDATE bets SET status = 'resolved' WHERE store_hash = ?", (msg.storeHash,)
-        )
-        conn.commit()
-        conn.close()
+        # Sign and send transaction with retry logic
+        try:
+            signed_tx = w3.eth.account.sign_transaction(tx, AGENT_PRIVATE_KEY)
+            tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            
+            # Wait for transaction receipt (with timeout)
+            receipt = None
+            for _ in range(30):  # Try for 5 minutes (30 * 10 seconds)
+                try:
+                    receipt = w3.eth.get_transaction_receipt(tx_hash)
+                    if receipt:
+                        break
+                except:
+                    pass
+                await asyncio.sleep(10)
+                
+            if receipt and receipt.status == 1:
+                ctx.logger.info(f"Transaction successful: {tx_hash.hex()}")
+                if home_score == away_score:
+                    BLOCKCHAIN_TRANSACTIONS.labels(type="declare_draw", status="success").inc()
+                else:
+                    BLOCKCHAIN_TRANSACTIONS.labels(type="release_funds", status="success").inc()
+                    
+                # Update bet status in database
+                await db.update_bet_status(msg.storeHash, "resolved")
+                BET_RESOLUTIONS.labels(status="success").inc()
+            else:
+                ctx.logger.error(f"Transaction failed or timed out: {tx_hash.hex()}")
+                if home_score == away_score:
+                    BLOCKCHAIN_TRANSACTIONS.labels(type="declare_draw", status="failed").inc()
+                else:
+                    BLOCKCHAIN_TRANSACTIONS.labels(type="release_funds", status="failed").inc()
+                BET_RESOLUTIONS.labels(status="tx_failed").inc()
+        except Exception as e:
+            ctx.logger.error(f"Error sending transaction: {e}")
+            BLOCKCHAIN_TRANSACTIONS.labels(type="transaction", status="error").inc()
+            BET_RESOLUTIONS.labels(status="tx_error").inc()
 
     except Exception as e:
         ctx.logger.error(f"Error resolving bet {msg.storeHash}: {e}")
+        BET_RESOLUTIONS.labels(status="general_error").inc()
 
 
+# Resolve bet handler for primary agent
+@resolver_agent_primary.on_message(model=BetResolution)
+async def resolve_primary_bet(ctx: Context, sender: str, msg: BetResolution):
+    await resolve_bet_common(ctx, sender, msg)
+
+
+# Resolve bet handler for backup agent
+@resolver_agent_backup.on_message(model=BetResolution)
+async def resolve_backup_bet(ctx: Context, sender: str, msg: BetResolution):
+    await resolve_bet_common(ctx, sender, msg)
+
+
+# Watchdog process to ensure the agent is running
+def watchdog_process():
+    while True:
+        try:
+            # Check if any agent process is running
+            primary_port_open = False
+            backup_port_open = False
+            
+            try:
+                # Check primary agent port
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2)
+                result = sock.connect_ex(('localhost', 8000))
+                sock.close()
+                primary_port_open = (result == 0)
+            except:
+                primary_port_open = False
+                
+            try:
+                # Check backup agent port
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2)
+                result = sock.connect_ex(('localhost', 8002))
+                sock.close()
+                backup_port_open = (result == 0)
+            except:
+                backup_port_open = False
+            
+            # If neither agent is running, restart primary
+            if not primary_port_open and not backup_port_open:
+                logger.critical("Both agents are down! Attempting to restart primary...")
+                
+                try:
+                    # Use subprocess to start the primary agent in a new process
+                    import subprocess
+                    subprocess.Popen(["python", __file__, "--agent=primary"], 
+                                    start_new_session=True)
+                    logger.info("Primary agent restart initiated")
+                except Exception as e:
+                    logger.critical(f"Failed to restart primary agent: {e}")
+                    
+                    # Alert via healthchecks.io with fail signal
+                    try:
+                        healthcheck.fail()
+                    except:
+                        pass
+        except Exception as e:
+            logger.error(f"Watchdog process error: {e}")
+            
+        time.sleep(60)  # Check every minute
+
+
+# Main function to start the agents
 if __name__ == "__main__":
-    import asyncio
-
-    resolver_agent.run()
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Football Bet Resolver Agent')
+    parser.add_argument('--agent', type=str, default='both', choices=['primary', 'backup', 'watchdog', 'both'],
+                      help='Which agent to run')
+    
+    args = parser.parse_args()
+    
+    if args.agent == 'primary' or args.agent == 'both':
+        # Start primary agent in a separate thread
+        primary_thread = threading.Thread(target=resolver_agent_primary.run)
+        primary_thread.daemon = True
+        primary_thread.start()
+        logger.info("Primary agent started")
+        
+    if args.agent == 'backup' or args.agent == 'both':
+        # Start backup agent in a separate thread
+        backup_thread = threading.Thread(target=resolver_agent_backup.run)
+        backup_thread.daemon = True
+        backup_thread.start()
+        logger.info("Backup agent started")
+        
+    if args.agent == 'watchdog' or args.agent == 'both':
+        # Start watchdog process
+        watchdog_thread = threading.Thread(target=watchdog_process)
+        watchdog_thread.daemon = True
+        watchdog_thread.start()
+        logger.info("Watchdog process started")
+    
+    # If running both, keep the main thread alive
+    if args.agent == 'both':
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Shutting down agents...")
+            # Perform clean shutdown if needed
